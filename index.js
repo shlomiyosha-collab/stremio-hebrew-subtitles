@@ -1,10 +1,8 @@
-
 const express = require("express");
 const unzipper = require("unzipper");
 const { addonBuilder, getRouter } = require("stremio-addon-sdk");
 
 const PORT = process.env.PORT || 7000;
-// Render מגדיר את זה אוטומטית. מקומית: כתובת ה-localhost
 const BASE_URL = (
   process.env.RENDER_EXTERNAL_URL ||
   process.env.BASE_URL ||
@@ -13,9 +11,9 @@ const BASE_URL = (
 
 const manifest = {
   id: "community.hebrew.subtitles",
-  version: "1.1.0",
+  version: "1.2.0",
   name: "כתוביות בעברית",
-  description: "כתוביות בעברית מ-OpenSubtitles ומ-Wizdom",
+  description: "כתוביות בעברית מ-OpenSubtitles ומ-Wizdom, ותרגום אוטומטי כשאין",
   resources: ["subtitles"],
   types: ["movie", "series"],
   idPrefixes: ["tt"],
@@ -23,9 +21,10 @@ const manifest = {
 };
 
 const builder = new addonBuilder(manifest);
+const HEB = ["heb", "he", "iw"];
 
 // ---------- מקור 1: OpenSubtitles ----------
-async function fromOpenSubtitles(type, id, extra) {
+async function fetchOS(type, id, extra) {
   const extraStr = Object.keys(extra || {}).length
     ? "/" + new URLSearchParams(extra).toString()
     : "";
@@ -33,9 +32,7 @@ async function fromOpenSubtitles(type, id, extra) {
   const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
   if (!res.ok) return [];
   const data = await res.json();
-  return (data.subtitles || [])
-    .filter((s) => ["heb", "he", "iw"].includes(s.lang))
-    .map((s, i) => ({ id: `[OS]${s.id || i}`, url: s.url, lang: "heb" }));
+  return data.subtitles || [];
 }
 
 // ---------- מקור 2: Wizdom ----------
@@ -63,23 +60,176 @@ async function fromWizdom(type, id) {
 }
 
 builder.defineSubtitlesHandler(async ({ type, id, extra }) => {
-  const results = await Promise.allSettled([
-    fromOpenSubtitles(type, id, extra),
+  const [osRes, wzRes] = await Promise.allSettled([
+    fetchOS(type, id, extra),
     fromWizdom(type, id)
   ]);
-  results.forEach((r, i) => {
-    if (r.status === "rejected") console.error(`מקור ${i} נכשל:`, r.reason?.message);
-  });
-  const subtitles = results
-    .filter((r) => r.status === "fulfilled")
-    .flatMap((r) => r.value);
-  return { subtitles, cacheMaxAge: 3600 };
+  const osAll = osRes.status === "fulfilled" ? osRes.value : [];
+  const wz = wzRes.status === "fulfilled" ? wzRes.value : [];
+  if (osRes.status === "rejected") console.error("OS נכשל:", osRes.reason?.message);
+  if (wzRes.status === "rejected") console.error("Wizdom נכשל:", wzRes.reason?.message);
+
+  const subtitles = [
+    ...osAll
+      .filter((s) => HEB.includes(s.lang))
+      .map((s, i) => ({ id: `[OS]${s.id || i}`, url: s.url, lang: "heb" })),
+    ...wz
+  ];
+
+  // אין כתובית בעברית? מוסיפים תרגום אוטומטי מהאנגלית (מתבצע רק כשבוחרים אותו)
+  if (subtitles.length === 0) {
+    const eng = osAll.find((s) => s.lang === "eng" || s.lang === "en");
+    if (eng && eng.url) {
+      const token = Buffer.from(eng.url).toString("base64url");
+      subtitles.push({
+        id: "[AUTO-GOOGLE]תרגום אוטומטי",
+        url: `${BASE_URL}/auto/${token}.srt`,
+        lang: "heb"
+      });
+    }
+  }
+  return { subtitles, cacheMaxAge: 1800 };
 });
+
+// ---------- תרגום אוטומטי ----------
+function decodeText(buf) {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(buf);
+  } catch {
+    return new TextDecoder("windows-1252").decode(buf);
+  }
+}
+
+function parseSrt(text) {
+  const blocks = text.replace(/\r/g, "").trim().split(/\n\s*\n/);
+  const cues = [];
+  for (const b of blocks) {
+    const lines = b.split("\n");
+    const ti = lines.findIndex((l) => l.includes("-->"));
+    if (ti === -1) continue;
+    const body = lines
+      .slice(ti + 1)
+      .join("\n")
+      .replace(/<[^>]+>/g, "")
+      .replace(/\{\\[^}]*\}/g, "")
+      .trim();
+    cues.push({ time: lines[ti], text: body });
+  }
+  return cues;
+}
+
+async function googleTranslate(text) {
+  const r = await fetch(
+    "https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=iw&dt=t",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "q=" + encodeURIComponent(text),
+      signal: AbortSignal.timeout(12000)
+    }
+  );
+  if (!r.ok) throw new Error("google " + r.status);
+  const d = await r.json();
+  return d[0].map((x) => x[0]).join("");
+}
+
+const SEP = "\n@@@\n";
+async function translateChunk(texts) {
+  try {
+    const out = (await googleTranslate(texts.join(SEP))).split(/\s*@@@\s*/);
+    if (out.length === texts.length) return out;
+  } catch (e) {
+    console.error("chunk:", e.message);
+  }
+  // גיבוי: שורה אחר שורה
+  const res = [];
+  for (const t of texts) {
+    try {
+      res.push(await googleTranslate(t));
+    } catch {
+      res.push(t);
+    }
+  }
+  return res;
+}
+
+async function translateCues(cues) {
+  const chunks = [];
+  let cur = [];
+  let len = 0;
+  cues.forEach((c, i) => {
+    if (cur.length && (len + c.text.length > 3000 || cur.length >= 40)) {
+      chunks.push(cur);
+      cur = [];
+      len = 0;
+    }
+    cur.push(i);
+    len += c.text.length + 5;
+  });
+  if (cur.length) chunks.push(cur);
+
+  const results = new Array(cues.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < chunks.length) {
+      const idxs = chunks[next++];
+      const out = await translateChunk(idxs.map((i) => cues[i].text));
+      idxs.forEach((cueIdx, k) => (results[cueIdx] = out[k]));
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  return results;
+}
+
+function buildSrt(cues, translated) {
+  return (
+    cues
+      .map((c, i) => {
+        const t = (translated[i] || c.text)
+          .split("\n")
+          .map((l) => "\u200F" + l.trim())
+          .join("\n");
+        return `${i + 1}\n${c.time}\n${t}`;
+      })
+      .join("\n\n") + "\n"
+  );
+}
+
+const autoCache = new Map(); // token -> Promise<string>
+function getAuto(token) {
+  if (autoCache.has(token)) return autoCache.get(token);
+  const p = (async () => {
+    const url = Buffer.from(token, "base64url").toString();
+    if (!/^https?:\/\//.test(url)) throw new Error("bad url");
+    const r = await fetch(url, { signal: AbortSignal.timeout(15000) });
+    if (!r.ok) throw new Error("source " + r.status);
+    const cues = parseSrt(decodeText(Buffer.from(await r.arrayBuffer())));
+    if (!cues.length) throw new Error("empty srt");
+    return buildSrt(cues, await translateCues(cues));
+  })();
+  autoCache.set(token, p);
+  p.catch(() => autoCache.delete(token));
+  if (autoCache.size > 30) autoCache.delete(autoCache.keys().next().value);
+  return p;
+}
 
 // ---------- שרת ----------
 const app = express();
 
-// Wizdom מחזיר ZIP. כאן מחלצים את ה-SRT ומחזירים אותו כ-UTF-8
+app.get("/auto/:token.srt", async (req, res) => {
+  try {
+    const srt = await getAuto(req.params.token);
+    res.set({
+      "Content-Type": "text/plain; charset=utf-8",
+      "Access-Control-Allow-Origin": "*"
+    });
+    res.send(srt);
+  } catch (e) {
+    console.error("auto error:", e.message);
+    res.status(500).send("error");
+  }
+});
+
 app.get("/srt/:id.srt", async (req, res) => {
   try {
     const r = await fetch(`https://wizdom.xyz/api/files/sub/${req.params.id}`, {
