@@ -11,7 +11,7 @@ const BASE_URL = (
 
 const manifest = {
   id: "community.hebrew.subtitles",
-  version: "1.2.0",
+  version: "1.3.0",
   name: "כתוביות בעברית",
   description: "כתוביות בעברית מ-OpenSubtitles ומ-Wizdom, ותרגום אוטומטי כשאין",
   resources: ["subtitles"],
@@ -65,28 +65,71 @@ async function fromWizdom(type, id) {
     }));
 }
 
+// ---------- מקור 3: SubDL (דורש מפתח חינמי: SUBDL_API_KEY) ----------
+const SUBDL_KEY = process.env.SUBDL_API_KEY;
+
+async function subdlSearch(type, id, langs) {
+  if (!SUBDL_KEY) return [];
+  const [imdb, season, episode] = id.split(":");
+  const p = new URLSearchParams({
+    api_key: SUBDL_KEY,
+    imdb_id: imdb,
+    type: type === "series" ? "tv" : "movie",
+    languages: langs,
+    subs_per_page: "10"
+  });
+  const isEp = type === "series" && season && episode;
+  if (isEp) {
+    p.set("season_number", season);
+    p.set("episode_number", episode);
+  }
+  const r = await fetch("https://api.subdl.com/api/v1/subtitles?" + p, {
+    signal: AbortSignal.timeout(10000)
+  });
+  if (!r.ok) {
+    console.error("SubDL status", r.status);
+    return [];
+  }
+  const d = await r.json();
+  const qs = isEp ? `?s=${season}&e=${episode}` : "";
+  return (d.subtitles || [])
+    .filter((x) => x && x.url)
+    .map((x) => `${BASE_URL}/zip/${Buffer.from(x.url).toString("base64url")}.srt${qs}`);
+}
+
 builder.defineSubtitlesHandler(async ({ type, id, extra }) => {
-  const [osRes, wzRes] = await Promise.allSettled([
+  const [osRes, wzRes, sdRes] = await Promise.allSettled([
     fetchOS(type, id, extra),
-    fromWizdom(type, id)
+    fromWizdom(type, id),
+    subdlSearch(type, id, "HE")
   ]);
   const osAll = osRes.status === "fulfilled" ? osRes.value : [];
   const wz = wzRes.status === "fulfilled" ? wzRes.value : [];
+  const sd = sdRes.status === "fulfilled" ? sdRes.value : [];
   if (osRes.status === "rejected") console.error("OS נכשל:", osRes.reason?.message);
   if (wzRes.status === "rejected") console.error("Wizdom נכשל:", wzRes.reason?.message);
+  if (sdRes.status === "rejected") console.error("SubDL נכשל:", sdRes.reason?.message);
 
   const subtitles = [
     ...osAll
       .filter((s) => HEB.includes(s.lang))
       .map((s, i) => ({ id: `[OS]${s.id || i}`, url: s.url, lang: "heb" })),
-    ...wz
+    ...wz,
+    ...sd.map((url, i) => ({ id: `[SUBDL]${i}`, url, lang: "heb" }))
   ];
 
   // אין כתובית בעברית? מוסיפים תרגום אוטומטי מהאנגלית (מתבצע רק כשבוחרים אותו)
   if (subtitles.length === 0) {
-    const eng = osAll.find((s) => s.lang === "eng" || s.lang === "en");
-    if (eng && eng.url) {
-      const token = Buffer.from(eng.url).toString("base64url");
+    let engUrl = (osAll.find((s) => s.lang === "eng" || s.lang === "en") || {}).url;
+    if (!engUrl) {
+      try {
+        engUrl = (await subdlSearch(type, id, "EN"))[0];
+      } catch (e) {
+        console.error("SubDL EN:", e.message);
+      }
+    }
+    if (engUrl) {
+      const token = Buffer.from(engUrl).toString("base64url");
       subtitles.push({
         id: "[AUTO-GOOGLE]תרגום אוטומטי",
         url: `${BASE_URL}/auto/${token}.srt`,
@@ -251,7 +294,52 @@ app.get("/debug/:type/:id", async (req, res) => {
   } catch (e) {
     out.wizdom = { error: e.message };
   }
+  try {
+    out.subdl = { hasKey: !!SUBDL_KEY };
+    if (SUBDL_KEY) {
+      out.subdl.hebrew = (await subdlSearch(type, id, "HE")).length;
+      out.subdl.english = (await subdlSearch(type, id, "EN")).length;
+    }
+  } catch (e) {
+    out.subdl = { error: e.message };
+  }
   res.json(out);
+});
+
+app.get("/zip/:token.srt", async (req, res) => {
+  try {
+    const path = Buffer.from(req.params.token, "base64url").toString();
+    if (!/^\/subtitle\/[\w.\-%]+\.zip$/.test(path)) return res.status(400).send("bad");
+    const r = await fetch("https://dl.subdl.com" + path, {
+      signal: AbortSignal.timeout(20000)
+    });
+    if (!r.ok) return res.status(502).send("download failed");
+    const dir = await unzipper.Open.buffer(Buffer.from(await r.arrayBuffer()));
+    const srts = dir.files.filter((f) => /\.srt$/i.test(f.path));
+    if (!srts.length) return res.status(404).send("no srt");
+    let file = srts[0];
+    const sn = Number(req.query.s);
+    const en = Number(req.query.e);
+    if (srts.length > 1 && sn && en) {
+      const re = new RegExp(`s0*${sn}[ ._-]*e0*${en}(?!\\d)|\\b${sn}x0*${en}(?!\\d)`, "i");
+      file = srts.find((f) => re.test(f.path)) || file;
+    }
+    const raw = await file.buffer();
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(raw);
+    } catch {
+      text = new TextDecoder("windows-1255").decode(raw);
+    }
+    res.set({
+      "Content-Type": "text/plain; charset=utf-8",
+      "Access-Control-Allow-Origin": "*"
+    });
+    res.send(text);
+  } catch (e) {
+    console.error("zip error:", e.message);
+    res.status(500).send("error");
+  }
 });
 
 app.get("/auto/:token.srt", async (req, res) => {
