@@ -11,7 +11,7 @@ const BASE_URL = (
 
 const manifest = {
   id: "community.hebrew.subtitles",
-  version: "1.3.1",
+  version: "1.3.3",
   name: "כתוביות בעברית",
   description: "כתוביות בעברית מ-OpenSubtitles ומ-Wizdom, ותרגום אוטומטי כשאין",
   resources: ["subtitles"],
@@ -174,7 +174,7 @@ async function googleTranslate(text) {
   try {
     const r = await fetch(
       `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=he&dt=t&q=${q}`,
-      { signal: AbortSignal.timeout(12000), headers: { "User-Agent": "Mozilla/5.0" } }
+      { signal: AbortSignal.timeout(8000), headers: { "User-Agent": "Mozilla/5.0" } }
     );
     if (r.ok) {
       const d = await r.json();
@@ -188,7 +188,7 @@ async function googleTranslate(text) {
   try {
     const r = await fetch(
       `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=en&tl=he&q=${q}`,
-      { signal: AbortSignal.timeout(12000), headers: { "User-Agent": "Mozilla/5.0" } }
+      { signal: AbortSignal.timeout(8000), headers: { "User-Agent": "Mozilla/5.0" } }
     );
     if (r.ok) {
       const d = await r.json();
@@ -204,13 +204,16 @@ async function googleTranslate(text) {
 
 const SEP = "\n@@@\n";
 async function translateChunk(texts) {
+  let hardFail = false;
   try {
     const out = (await googleTranslate(texts.join(SEP))).split(/\s*@@@\s*/);
-    if (out.length === texts.length) return out;
+    if (out.length === texts.length) return { out, hardFail };
   } catch (e) {
     console.error("chunk:", e.message);
+    // גוגל לא עונה בכלל: אין טעם לנסות שורה-שורה
+    return { out: texts.map(() => null), hardFail: true };
   }
-  // גיבוי: שורה אחר שורה
+  // גוגל ענה אבל ההפרדה נשברה: גיבוי שורה אחר שורה
   const res = [];
   for (const t of texts) {
     try {
@@ -219,7 +222,7 @@ async function translateChunk(texts) {
       res.push(null);
     }
   }
-  return res;
+  return { out: res, hardFail };
 }
 
 async function translateCues(cues) {
@@ -227,7 +230,7 @@ async function translateCues(cues) {
   let cur = [];
   let len = 0;
   cues.forEach((c, i) => {
-    if (cur.length && (len + c.text.length > 3000 || cur.length >= 40)) {
+    if (cur.length && (len + c.text.length > 1500 || cur.length >= 25)) {
       chunks.push(cur);
       cur = [];
       len = 0;
@@ -239,14 +242,17 @@ async function translateCues(cues) {
 
   const results = new Array(cues.length);
   let next = 0;
+  let hardFails = 0;
   const worker = async () => {
-    while (next < chunks.length) {
+    while (next < chunks.length && hardFails < 3) {
       const idxs = chunks[next++];
-      const out = await translateChunk(idxs.map((i) => cues[i].text));
+      const { out, hardFail } = await translateChunk(idxs.map((i) => cues[i].text));
+      if (hardFail) hardFails++;
       idxs.forEach((cueIdx, k) => (results[cueIdx] = out[k]));
     }
   };
   await Promise.all([worker(), worker(), worker(), worker()]);
+  if (hardFails >= 3) throw new Error("Google Translate is not responding");
   const failed = results.filter((x) => !x).length;
   if (failed > cues.length * 0.2) {
     throw new Error(`translation failed for ${failed}/${cues.length} cues`);
@@ -330,6 +336,24 @@ app.get("/debug/:type/:id", async (req, res) => {
   res.json(out);
 });
 
+// בדיקת כל תהליך התרגום: /debug-auto/series/tt5998226:1:1
+app.get("/debug-auto/:type/:id", async (req, res) => {
+  const { type, id } = req.params;
+  const t0 = Date.now();
+  try {
+    const osAll = await fetchOS(type, id, {}).catch(() => []);
+    let engUrl = (osAll.find((x) => x.lang === "eng" || x.lang === "en") || {}).url;
+    const source = engUrl ? "opensubtitles" : "subdl";
+    if (!engUrl) engUrl = (await subdlSearch(type, id, "EN"))[0];
+    if (!engUrl) return res.json({ ok: false, error: "no english subtitle found" });
+    const token = Buffer.from(engUrl).toString("base64url");
+    const srt = await getAuto(token);
+    res.json({ ok: true, source, seconds: (Date.now() - t0) / 1000, sample: srt.slice(0, 400) });
+  } catch (e) {
+    res.json({ ok: false, seconds: (Date.now() - t0) / 1000, error: e.message });
+  }
+});
+
 // בדיקת תרגום: /debug-translate
 app.get("/debug-translate", async (req, res) => {
   try {
@@ -385,7 +409,7 @@ app.get("/auto/:token.srt", async (req, res) => {
     res.send(srt);
   } catch (e) {
     console.error("auto error:", e.message);
-    res.status(500).send("error");
+    res.status(500).send("error: " + e.message);
   }
 });
 
