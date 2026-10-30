@@ -29,8 +29,11 @@ async function fetchOS(type, id, extra) {
     ? "/" + new URLSearchParams(extra).toString()
     : "";
   const url = `https://opensubtitles-v3.strem.io/subtitles/${type}/${id}${extraStr}.json`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-  if (!res.ok) return [];
+  const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+  if (!res.ok) {
+    console.error("OS status", res.status, url);
+    return [];
+  }
   const data = await res.json();
   return data.subtitles || [];
 }
@@ -42,7 +45,10 @@ async function fromWizdom(type, id) {
     signal: AbortSignal.timeout(8000),
     headers: { "User-Agent": "Mozilla/5.0" }
   });
-  if (!res.ok) return [];
+  if (!res.ok) {
+    console.error("Wizdom status", res.status);
+    return [];
+  }
   const data = await res.json();
   let subs = data.subs;
   if (type === "series" && season && episode) {
@@ -215,6 +221,38 @@ function getAuto(token) {
 
 // ---------- שרת ----------
 const app = express();
+
+// בדיקת אבחון: /debug/series/tt5998226:1:1
+app.get("/debug/:type/:id", async (req, res) => {
+  const { type, id } = req.params;
+  const out = { baseUrl: BASE_URL };
+  try {
+    const url = `https://opensubtitles-v3.strem.io/subtitles/${type}/${id}.json`;
+    const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    const t = await r.text();
+    out.opensubtitles = { status: r.status, total: 0, langs: [] };
+    try {
+      const subs = JSON.parse(t).subtitles || [];
+      out.opensubtitles.total = subs.length;
+      out.opensubtitles.langs = [...new Set(subs.map((x) => x.lang))];
+    } catch {
+      out.opensubtitles.body = t.slice(0, 200);
+    }
+  } catch (e) {
+    out.opensubtitles = { error: e.message };
+  }
+  try {
+    const imdb = id.split(":")[0];
+    const r = await fetch(`https://wizdom.xyz/api/releases/${imdb}`, {
+      signal: AbortSignal.timeout(10000),
+      headers: { "User-Agent": "Mozilla/5.0" }
+    });
+    out.wizdom = { status: r.status, body: (await r.text()).slice(0, 200) };
+  } catch (e) {
+    out.wizdom = { error: e.message };
+  }
+  res.json(out);
+});
 
 app.get("/auto/:token.srt", async (req, res) => {
   try {
