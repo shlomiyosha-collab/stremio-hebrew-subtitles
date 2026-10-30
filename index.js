@@ -11,7 +11,7 @@ const BASE_URL = (
 
 const manifest = {
   id: "community.hebrew.subtitles",
-  version: "1.3.0",
+  version: "1.3.1",
   name: "כתוביות בעברית",
   description: "כתוביות בעברית מ-OpenSubtitles ומ-Wizdom, ותרגום אוטומטי כשאין",
   resources: ["subtitles"],
@@ -168,18 +168,38 @@ function parseSrt(text) {
 }
 
 async function googleTranslate(text) {
-  const r = await fetch(
-    "https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=iw&dt=t",
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: "q=" + encodeURIComponent(text),
-      signal: AbortSignal.timeout(12000)
-    }
-  );
-  if (!r.ok) throw new Error("google " + r.status);
-  const d = await r.json();
-  return d[0].map((x) => x[0]).join("");
+  const q = encodeURIComponent(text);
+  const errors = [];
+  // ניסיון 1: ממשק gtx
+  try {
+    const r = await fetch(
+      `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=he&dt=t&q=${q}`,
+      { signal: AbortSignal.timeout(12000), headers: { "User-Agent": "Mozilla/5.0" } }
+    );
+    if (r.ok) {
+      const d = await r.json();
+      const out = d[0].map((x) => x[0]).join("");
+      if (out) return out;
+    } else errors.push("gtx " + r.status);
+  } catch (e) {
+    errors.push("gtx " + e.message);
+  }
+  // ניסיון 2: ממשק נוסף של גוגל
+  try {
+    const r = await fetch(
+      `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=en&tl=he&q=${q}`,
+      { signal: AbortSignal.timeout(12000), headers: { "User-Agent": "Mozilla/5.0" } }
+    );
+    if (r.ok) {
+      const d = await r.json();
+      const first = Array.isArray(d) ? d[0] : d;
+      const out = Array.isArray(first) ? first[0] : first;
+      if (typeof out === "string" && out) return out;
+    } else errors.push("dict " + r.status);
+  } catch (e) {
+    errors.push("dict " + e.message);
+  }
+  throw new Error("translate failed: " + errors.join(" | "));
 }
 
 const SEP = "\n@@@\n";
@@ -196,7 +216,7 @@ async function translateChunk(texts) {
     try {
       res.push(await googleTranslate(t));
     } catch {
-      res.push(t);
+      res.push(null);
     }
   }
   return res;
@@ -227,6 +247,10 @@ async function translateCues(cues) {
     }
   };
   await Promise.all([worker(), worker(), worker(), worker()]);
+  const failed = results.filter((x) => !x).length;
+  if (failed > cues.length * 0.2) {
+    throw new Error(`translation failed for ${failed}/${cues.length} cues`);
+  }
   return results;
 }
 
@@ -304,6 +328,15 @@ app.get("/debug/:type/:id", async (req, res) => {
     out.subdl = { error: e.message };
   }
   res.json(out);
+});
+
+// בדיקת תרגום: /debug-translate
+app.get("/debug-translate", async (req, res) => {
+  try {
+    res.json({ ok: true, result: await googleTranslate("Hello, how are you?") });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
 });
 
 app.get("/zip/:token.srt", async (req, res) => {
