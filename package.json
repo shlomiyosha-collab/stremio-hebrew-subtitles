@@ -1,12 +1,14 @@
 {
   "name": "stremio-hebrew-subtitles",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "תוסף כתוביות בעברית ל-Stremio",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "stremio-addon-sdk": "^1.6.10"
+    "express": "^4.19.2",
+    "stremio-addon-sdk": "^1.6.10",
+    "unzipper": "^0.12.3"
   }
 }
